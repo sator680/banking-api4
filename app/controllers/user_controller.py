@@ -6,7 +6,8 @@ from app.models.transaction import Transaction
 
 user_bp = Blueprint("users", __name__)
 
-VALID_TYPES = ["courant", "epargne", "entreprise"]
+VALID_TYPES   = ["courant", "epargne", "entreprise"]
+VALID_BANQUES = ["UBA", "CCA", "Afriland First Bank"]
 
 
 # ════════════════════════════════════════════════
@@ -25,7 +26,7 @@ def add_user():
         required: true
         schema:
           type: object
-          required: [nom, prenom, email, telephone]
+          required: [nom, prenom, email, telephone, banque, password]
           properties:
             nom:
               type: string
@@ -43,6 +44,13 @@ def add_user():
               type: string
               enum: [courant, epargne, entreprise]
               example: courant
+            banque:
+              type: string
+              enum: [UBA, CCA, Afriland First Bank]
+              example: UBA
+            password:
+              type: string
+              example: "MonMotDePasse123"
     responses:
       201:
         description: Utilisateur créé avec succès
@@ -57,7 +65,7 @@ def add_user():
             return jsonify({"success": False, "message": "Corps JSON manquant"}), 400
 
         # Vérification des champs obligatoires
-        manquants = [f for f in ["nom", "prenom", "email", "telephone"] if not data.get(f)]
+        manquants = [f for f in ["nom", "prenom", "email", "telephone", "banque", "password"] if not data.get(f)]
         if manquants:
             return jsonify({"success": False, "message": f"Champs manquants : {', '.join(manquants)}"}), 400
 
@@ -70,13 +78,25 @@ def add_user():
         if type_compte not in VALID_TYPES:
             return jsonify({"success": False, "message": f"type_compte invalide. Valeurs acceptées : {VALID_TYPES}"}), 400
 
+        # Banque
+        banque = data["banque"].strip()
+        if banque not in VALID_BANQUES:
+            return jsonify({"success": False, "message": f"banque invalide. Valeurs acceptées : {VALID_BANQUES}"}), 400
+
+        # Mot de passe
+        password = data["password"]
+        if len(password) < 6:
+            return jsonify({"success": False, "message": "Le mot de passe doit contenir au moins 6 caractères"}), 400
+
         user = User(
             nom=data["nom"].strip(),
             prenom=data["prenom"].strip(),
             email=data["email"].strip().lower(),
             telephone=data["telephone"].strip(),
             type_compte=type_compte,
+            banque=banque,
         )
+        user.set_password(password)
         db.session.add(user)
         db.session.commit()
 
@@ -477,4 +497,130 @@ def get_transactions(user_id):
         }), 200
 
     except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ════════════════════════════════════════════════
+# POST /api/users/<id>/transfert — Transfert entre comptes
+# ════════════════════════════════════════════════
+@user_bp.route("/<user_id>/transfert", methods=["POST"])
+def transfert(user_id):
+    """
+    Effectuer un transfert vers un autre compte (toutes banques)
+    ---
+    tags:
+      - Transactions
+    parameters:
+      - in: path
+        name: user_id
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required: [numero_compte_destinataire, montant, password]
+          properties:
+            numero_compte_destinataire:
+              type: string
+              example: "BK202614448926"
+            montant:
+              type: number
+              example: 5000
+            password:
+              type: string
+              example: "MonMotDePasse123"
+            description:
+              type: string
+              example: "Remboursement loyer"
+    responses:
+      200:
+        description: Transfert effectué avec succès
+      400:
+        description: Solde insuffisant, montant invalide ou mot de passe incorrect
+      401:
+        description: Mot de passe incorrect
+      404:
+        description: Compte introuvable
+    """
+    try:
+        expediteur = db.session.get(User, user_id)
+        if not expediteur:
+            return jsonify({"success": False, "message": "Compte expéditeur introuvable"}), 404
+
+        if not expediteur.actif:
+            return jsonify({"success": False, "message": "Compte expéditeur désactivé"}), 400
+
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "message": "Corps JSON manquant"}), 400
+
+        manquants = [f for f in ["numero_compte_destinataire", "montant", "password"] if not data.get(f)]
+        if manquants:
+            return jsonify({"success": False, "message": f"Champs manquants : {', '.join(manquants)}"}), 400
+
+        # Vérification du mot de passe
+        if not expediteur.password_hash or not expediteur.check_password(data["password"]):
+            return jsonify({"success": False, "message": "Mot de passe incorrect"}), 401
+
+        montant = data.get("montant")
+        if montant is None or montant <= 0:
+            return jsonify({"success": False, "message": "Le montant doit être supérieur à 0"}), 400
+
+        if montant > expediteur.solde:
+            return jsonify({
+                "success": False,
+                "message": f"Solde insuffisant. Solde disponible : {round(expediteur.solde, 2)}"
+            }), 400
+
+        destinataire = User.query.filter_by(numero_compte=data["numero_compte_destinataire"].strip()).first()
+        if not destinataire:
+            return jsonify({"success": False, "message": "Compte destinataire introuvable"}), 404
+
+        if not destinataire.actif:
+            return jsonify({"success": False, "message": "Compte destinataire désactivé"}), 400
+
+        if destinataire.id == expediteur.id:
+            return jsonify({"success": False, "message": "Impossible de transférer vers son propre compte"}), 400
+
+        description = data.get("description", "Transfert")
+
+        # Débit expéditeur
+        solde_avant_exp  = expediteur.solde
+        expediteur.solde -= montant
+        tx_envoi = Transaction(
+            user_id=expediteur.id,
+            type_op="transfert_envoi",
+            montant=montant,
+            solde_avant=solde_avant_exp,
+            solde_apres=expediteur.solde,
+            description=f"{description} → {destinataire.numero_compte} ({destinataire.banque})",
+        )
+
+        # Crédit destinataire
+        solde_avant_dest   = destinataire.solde
+        destinataire.solde += montant
+        tx_reception = Transaction(
+            user_id=destinataire.id,
+            type_op="transfert_reception",
+            montant=montant,
+            solde_avant=solde_avant_dest,
+            solde_apres=destinataire.solde,
+            description=f"{description} ← {expediteur.numero_compte} ({expediteur.banque})",
+        )
+
+        db.session.add_all([tx_envoi, tx_reception])
+        db.session.commit()
+
+        return jsonify({
+            "success":     True,
+            "message":     f"Transfert de {montant} effectué vers {destinataire.prenom} {destinataire.nom} ({destinataire.banque})",
+            "solde_avant": solde_avant_exp,
+            "solde_apres": expediteur.solde,
+            "transaction": tx_envoi.to_dict(),
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
         return jsonify({"success": False, "message": str(e)}), 500
